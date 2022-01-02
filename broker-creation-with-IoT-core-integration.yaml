@@ -1,0 +1,137 @@
+Parameters:
+  InstanceType: 
+    Default : t2.micro
+    AllowedValues: 
+      - t2.micro
+      - t2.nano
+    Description: Select the instance type for broker.
+    Type: String
+
+Resources: 
+  MyBrokerInstance: 
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /etc/mosquitto/conf.d/bridge.conf:
+              source: https://mosquittomqqtbrokerresources.s3.us-east-1.amazonaws.com/bridge.conf
+              BucketName: mosquittomqqtbrokerresources
+              KeyPrefix: '*'
+              mode: '000444'
+              owner: root
+              group: root
+              authentication: S3AccessCreds
+            
+            /etc/mosquitto/conf.d/default.conf:
+              content: |
+                listener 1883
+                listener 9001
+                allow_anonymous false
+                password_file /etc/mosquitto/passwd
+              mode: "000400"
+              owner: "root"
+              group: "root"
+
+      AWS::CloudFormation::Authentication:
+        S3AccessCreds:
+          type: S3
+          buckets:
+            - mosquittomqqtbrokerresources
+          roleName: !Ref RootRole    
+          
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0e472ba40eb589f49
+      AvailabilityZone: us-east-1a
+      IamInstanceProfile: !Ref RootInstanceProfile
+      KeyName: EC2-SSH
+      SecurityGroups: 
+        - !Ref SecurityGroupForBroker
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          sudo apt-get update
+          
+          yes Y | sudo apt install python3-pip
+          pip3 install awscli --force-reinstall --upgrade
+          sudo apt install software-properties-common
+          sudo apt-get update
+          sudo apt-get install -y python3-setuptools
+          sudo mkdir -p /opt/aws/bin
+          wget https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+          sudo python3 -m easy_install --script-dir /opt/aws/bin aws-cfn-bootstrap-py3-latest.tar.gz
+          sudo apt-add-repository ppa:mosquitto-dev/mosquitto-ppa
+          sudo apt-get update
+          yes Y | sudo apt-get install mosquitto
+          yes Y | sudo apt-get install mosquitto-clients
+          yes Y | sudo apt install awscli
+          cd /etc/mosquitto/certs/
+          sudo wget https://www.amazontrust.com/repository/AmazonRootCA1.pem -O rootCA.pem
+          myarn=$(sudo aws iot create-keys-and-certificate --set-as-active --certificate-pem-outfile cert.crt --private-key-outfile private.key --public-key-outfile public.key --region us-east-1 | grep certificateArn | cut -d '"' -f4)
+          aws iot attach-principal-policy --policy-name bridgeMQTT --principal "$myarn" --region ${AWS::Region}
+          sudo chmod 644 private.key
+          sudo chmod 644 cert.crt
+
+
+          apt-get update -y
+
+          # Start cfn-init
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource MyBrokerInstance --region ${AWS::Region}
+          
+          iotendpoint=$(aws iot describe-endpoint --endpoint-type iot:Data-ATS --region ${AWS::Region} | cut -d '}' -f1 | cut -d '{' -f2 | cut -d ':' -f2 | cut -d '"' -f2 | xargs echo -n )          
+          sudo sed -i "s/xxxxxxxxxxxxxxx-ats.iot.<region>.amazonaws.com/$iotendpoint/g" /etc/mosquitto/conf.d/bridge.conf
+
+          sudo service mosquitto restart
+
+          # cfn-init completed so signal success or not
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource MyBrokerInstance --region ${AWS::Region}
+
+  
+  SecurityGroupForBroker:
+    # DependsOn: MyBrokerInstance
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ingress traffic for SSH
+      SecurityGroupIngress:
+      - IpProtocol: -1
+        FromPort: -1
+        ToPort: -1
+        CidrIp: 0.0.0.0/0
+
+
+  RootRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Principal:
+              Service: ec2.amazonaws.com
+            Effect: Allow
+            Sid: ''
+      Policies:
+        - PolicyName: AuthenticatedS3GetObjects      
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - 's3:GetObject'
+                Resource:  'arn:aws:s3:::mosquittomqqtbrokerresources/*'
+                Effect: Allow
+        - PolicyName: AdministratorAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - '*'
+                Resource: '*'
+                Effect: Allow        
+        
+    
+  RootInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref RootRole
