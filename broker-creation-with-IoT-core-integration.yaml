@@ -6,6 +6,15 @@ Parameters:
       - t2.nano
     Description: Select the instance type for broker.
     Type: String
+    
+  KeyPair:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Description: Select key pair to ssh into instance from local instance.
+
+  SubnetForInstance: 
+    Type: "AWS::EC2::Subnet::Id"
+    Description: Select subnet for EC2 instance.
+
 
 Resources: 
   MyBrokerInstance: 
@@ -43,33 +52,47 @@ Resources:
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: ami-0e472ba40eb589f49
-      AvailabilityZone: us-east-1a
+      SubnetId: !Ref SubnetForInstance
       IamInstanceProfile: !Ref RootInstanceProfile
-      KeyName: EC2-SSH
-      SecurityGroups: 
-        - !Ref SecurityGroupForBroker
+      KeyName: !Ref KeyPair
+      SecurityGroupIds: 
+        - !GetAtt SecurityGroupForBroker.GroupId
       UserData: 
-        Fn::Base64: !Sub |
+        Fn::Base64: !Sub |  
           #!/bin/bash -xe
           sudo apt-get update
           
           yes Y | sudo apt install python3-pip
           pip3 install awscli --force-reinstall --upgrade
+
+          # provides some useful scripts for adding and removing PPAs
+          # https://askubuntu.com/questions/1000118/what-is-software-properties-common
           sudo apt install software-properties-common
+          
           sudo apt-get update
+          # python3-setuptools to easily manage python distributions.
           sudo apt-get install -y python3-setuptools
+
           sudo mkdir -p /opt/aws/bin
+
+          # Ref: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-helper-scripts-reference.html
           wget https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
           sudo python3 -m easy_install --script-dir /opt/aws/bin aws-cfn-bootstrap-py3-latest.tar.gz
+
           sudo apt-add-repository ppa:mosquitto-dev/mosquitto-ppa
+
           sudo apt-get update
+
           yes Y | sudo apt-get install mosquitto
           yes Y | sudo apt-get install mosquitto-clients
           yes Y | sudo apt install awscli
+
+          # Adding certificates in certs for IoT Core communication with hosted broker.
           cd /etc/mosquitto/certs/
           sudo wget https://www.amazontrust.com/repository/AmazonRootCA1.pem -O rootCA.pem
           myarn=$(sudo aws iot create-keys-and-certificate --set-as-active --certificate-pem-outfile cert.crt --private-key-outfile private.key --public-key-outfile public.key --region us-east-1 | grep certificateArn | cut -d '"' -f4)
           aws iot attach-principal-policy --policy-name bridgeMQTT --principal "$myarn" --region ${AWS::Region}
+          
           sudo chmod 644 private.key
           sudo chmod 644 cert.crt
 
@@ -110,6 +133,8 @@ Resources:
               Service: ec2.amazonaws.com
             Effect: Allow
             Sid: ''
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
       Policies:
         - PolicyName: AuthenticatedS3GetObjects      
           PolicyDocument:
@@ -124,7 +149,8 @@ Resources:
             Version: 2012-10-17
             Statement:
               - Action:
-                  - '*'
+                  - 'iot:*'
+                  - 'lambda:*'
                 Resource: '*'
                 Effect: Allow        
         
